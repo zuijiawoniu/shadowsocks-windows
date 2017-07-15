@@ -5,12 +5,15 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using System.Web;
+using System.Windows.Forms;
 using Newtonsoft.Json;
 
 using Shadowsocks.Controller.Strategy;
 using Shadowsocks.Model;
 using Shadowsocks.Properties;
 using Shadowsocks.Util;
+using System.Linq;
 
 namespace Shadowsocks.Controller
 {
@@ -37,25 +40,13 @@ namespace Shadowsocks.Controller
         private long _outboundCounter = 0;
         public long InboundCounter => Interlocked.Read(ref _inboundCounter);
         public long OutboundCounter => Interlocked.Read(ref _outboundCounter);
-        public QueueLast<TrafficPerSecond> traffic;
+        public Queue<TrafficPerSecond> trafficPerSecondQueue;
 
         private bool stopped = false;
-
-        private bool _systemProxyIsDirty = false;
 
         public class PathEventArgs : EventArgs
         {
             public string Path;
-        }
-
-        public class QueueLast<T> : Queue<T>
-        {
-            public T Last { get; private set; }
-            public new void Enqueue(T item)
-            {
-                Last = item;
-                base.Enqueue(item);
-            }
         }
 
         public class TrafficPerSecond
@@ -139,12 +130,12 @@ namespace Shadowsocks.Controller
             return null;
         }
 
-        public Server GetAServer(IStrategyCallerType type, IPEndPoint localIPEndPoint)
+        public Server GetAServer(IStrategyCallerType type, IPEndPoint localIPEndPoint, EndPoint destEndPoint)
         {
             IStrategy strategy = GetCurrentStrategy();
             if (strategy != null)
             {
-                return strategy.GetAServer(type, localIPEndPoint);
+                return strategy.GetAServer(type, localIPEndPoint, destEndPoint);
             }
             if (_config.index < 0)
             {
@@ -170,8 +161,13 @@ namespace Shadowsocks.Controller
         {
             try
             {
-                var server = new Server(ssURL);
-                _config.configs.Add(server);
+                if (ssURL.IsNullOrEmpty() || ssURL.IsWhiteSpace()) return false;
+                var servers = Server.GetServers(ssURL);
+                if (servers == null || servers.Count == 0) return false;
+                foreach (var server in servers)
+                {
+                    _config.configs.Add(server);
+                }
                 _config.index = _config.configs.Count - 1;
                 SaveConfig(_config);
                 return true;
@@ -186,7 +182,6 @@ namespace Shadowsocks.Controller
         public void ToggleEnable(bool enabled)
         {
             _config.enabled = enabled;
-            UpdateSystemProxy();
             SaveConfig(_config);
             if (EnableStatusChanged != null)
             {
@@ -197,7 +192,6 @@ namespace Shadowsocks.Controller
         public void ToggleGlobal(bool global)
         {
             _config.global = global;
-            UpdateSystemProxy();
             SaveConfig(_config);
             if (EnableGlobalChanged != null)
             {
@@ -221,12 +215,13 @@ namespace Shadowsocks.Controller
             SaveConfig(_config);
         }
 
-        public void EnableProxy(int type, string proxy, int port)
+        public void EnableProxy(int type, string proxy, int port, int timeout)
         {
             _config.proxy.useProxy = true;
             _config.proxy.proxyType = type;
             _config.proxy.proxyServer = proxy;
             _config.proxy.proxyPort = port;
+            _config.proxy.proxyTimeout = timeout;
             SaveConfig(_config);
         }
 
@@ -270,8 +265,9 @@ namespace Shadowsocks.Controller
             }
             if (_config.enabled)
             {
-                SystemProxy.Update(_config, true);
+                SystemProxy.Update(_config, true, null);
             }
+            Encryption.RNG.Close();
         }
 
         public void TouchPACFile()
@@ -300,11 +296,14 @@ namespace Shadowsocks.Controller
 
         public static string GetQRCode(Server server)
         {
-            string parts = server.method;
-            if (server.auth) parts += "-auth";
-            parts += ":" + server.password + "@" + server.server + ":" + server.server_port;
+            string tag = string.Empty;
+            string parts = $"{server.method}:{server.password}@{server.server}:{server.server_port}";
             string base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(parts));
-            return "ss://" + base64;
+            if(!server.remarks.IsNullOrEmpty())
+            {
+                tag = $"#{HttpUtility.UrlEncode(server.remarks, Encoding.UTF8)}";
+            }
+            return $"ss://{base64}{tag}";
         }
 
         public void UpdatePACFromGFWList()
@@ -326,7 +325,6 @@ namespace Shadowsocks.Controller
         public void SavePACUrl(string pacUrl)
         {
             _config.pacUrl = pacUrl;
-            UpdateSystemProxy();
             SaveConfig(_config);
             if (ConfigChanged != null)
             {
@@ -337,7 +335,16 @@ namespace Shadowsocks.Controller
         public void UseOnlinePAC(bool useOnlinePac)
         {
             _config.useOnlinePac = useOnlinePac;
-            UpdateSystemProxy();
+            SaveConfig(_config);
+            if (ConfigChanged != null)
+            {
+                ConfigChanged(this, new EventArgs());
+            }
+        }
+
+        public void ToggleSecureLocalPac(bool enabled)
+        {
+            _config.secureLocalPac = enabled;
             SaveConfig(_config);
             if (ConfigChanged != null)
             {
@@ -355,9 +362,9 @@ namespace Shadowsocks.Controller
             }
         }
 
-        public void SaveLogViewerConfig(LogViewerConfig newConfig)
+        public void ToggleCheckingPreRelease(bool enabled)
         {
-            _config.logViewer = newConfig;
+            _config.checkPreRelease = enabled;
             Configuration.Save(_config);
             if (ConfigChanged != null)
             {
@@ -365,9 +372,10 @@ namespace Shadowsocks.Controller
             }
         }
 
-        public void SaveProxyConfig(ProxyConfig newConfig)
+        public void SaveLogViewerConfig(LogViewerConfig newConfig)
         {
-            _config.proxy = newConfig;
+            _config.logViewer = newConfig;
+            newConfig.SaveSize();
             Configuration.Save(_config);
             if (ConfigChanged != null)
             {
@@ -413,6 +421,7 @@ namespace Shadowsocks.Controller
 
         protected void Reload()
         {
+            Encryption.RNG.Reload();
             // some logic in configuration updated the config when saving, we need to read it again
             _config = Configuration.Load();
             StatisticsConfiguration = StatisticsStrategyConfiguration.Load();
@@ -499,20 +508,7 @@ namespace Shadowsocks.Controller
 
         private void UpdateSystemProxy()
         {
-            if (_config.enabled)
-            {
-                SystemProxy.Update(_config, false);
-                _systemProxyIsDirty = true;
-            }
-            else
-            {
-                // only switch it off if we have switched it on
-                if (_systemProxyIsDirty)
-                {
-                    SystemProxy.Update(_config, false);
-                    _systemProxyIsDirty = false;
-                }
-            }
+            SystemProxy.Update(_config, false, _pacServer);
         }
 
         private void pacServer_PACFileChanged(object sender, EventArgs e)
@@ -541,10 +537,10 @@ namespace Shadowsocks.Controller
                 UpdatePACFromGFWList();
                 return;
             }
-            List<string> lines = GFWListUpdater.ParseResult(File.ReadAllText(Utils.GetTempPath("gfwlist.txt")));
+            List<string> lines = GFWListUpdater.ParseResult(FileManager.NonExclusiveReadAllText(Utils.GetTempPath("gfwlist.txt")));
             if (File.Exists(PACServer.USER_RULE_FILE))
             {
-                string local = File.ReadAllText(PACServer.USER_RULE_FILE, Encoding.UTF8);
+                string local = FileManager.NonExclusiveReadAllText(PACServer.USER_RULE_FILE, Encoding.UTF8);
                 using (var sr = new StringReader(local))
                 {
                     foreach (var rule in sr.NonWhiteSpaceLines())
@@ -558,7 +554,7 @@ namespace Shadowsocks.Controller
             string abpContent;
             if (File.Exists(PACServer.USER_ABP_FILE))
             {
-                abpContent = File.ReadAllText(PACServer.USER_ABP_FILE, Encoding.UTF8);
+                abpContent = FileManager.NonExclusiveReadAllText(PACServer.USER_ABP_FILE, Encoding.UTF8);
             }
             else
             {
@@ -567,13 +563,18 @@ namespace Shadowsocks.Controller
             abpContent = abpContent.Replace("__RULES__", JsonConvert.SerializeObject(lines, Formatting.Indented));
             if (File.Exists(PACServer.PAC_FILE))
             {
-                string original = File.ReadAllText(PACServer.PAC_FILE, Encoding.UTF8);
+                string original = FileManager.NonExclusiveReadAllText(PACServer.PAC_FILE, Encoding.UTF8);
                 if (original == abpContent)
                 {
                     return;
                 }
             }
             File.WriteAllText(PACServer.PAC_FILE, abpContent, Encoding.UTF8);
+        }
+
+        public void CopyPacUrl()
+        {
+            Clipboard.SetDataObject(_pacServer.PacUrl);
         }
 
         #region Memory Management
@@ -600,10 +601,10 @@ namespace Shadowsocks.Controller
 
         private void StartTrafficStatistics(int queueMaxSize)
         {
-            traffic = new QueueLast<TrafficPerSecond>();
+            trafficPerSecondQueue = new Queue<TrafficPerSecond>();
             for (int i = 0; i < queueMaxSize; i++)
             {
-                traffic.Enqueue(new TrafficPerSecond());
+                trafficPerSecondQueue.Enqueue(new TrafficPerSecond());
             }
             _trafficThread = new Thread(new ThreadStart(() => TrafficStatistics(queueMaxSize)));
             _trafficThread.IsBackground = true;
@@ -612,19 +613,20 @@ namespace Shadowsocks.Controller
 
         private void TrafficStatistics(int queueMaxSize)
         {
+            TrafficPerSecond previous, current;
             while (true)
             {
-                TrafficPerSecond previous = traffic.Last;
-                TrafficPerSecond current = new TrafficPerSecond();
+                previous = trafficPerSecondQueue.Last();
+                current = new TrafficPerSecond();
                 
-                var inbound = current.inboundCounter = InboundCounter;
-                var outbound = current.outboundCounter = OutboundCounter;
-                current.inboundIncreasement = inbound - previous.inboundCounter;
-                current.outboundIncreasement = outbound - previous.outboundCounter;
+                current.inboundCounter = InboundCounter;
+                current.outboundCounter = OutboundCounter;
+                current.inboundIncreasement = current.inboundCounter - previous.inboundCounter;
+                current.outboundIncreasement = current.outboundCounter - previous.outboundCounter;
 
-                traffic.Enqueue(current);
-                if (traffic.Count > queueMaxSize)
-                    traffic.Dequeue();
+                trafficPerSecondQueue.Enqueue(current);
+                if (trafficPerSecondQueue.Count > queueMaxSize)
+                    trafficPerSecondQueue.Dequeue();
 
                 TrafficChanged?.Invoke(this, new EventArgs());
 
